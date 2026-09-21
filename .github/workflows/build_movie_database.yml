@@ -1,0 +1,206 @@
+name: Build filtered movie database
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build_movie_database.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --quiet pandas
+
+      - name: Download source datasets
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 4 --retry-delay 5 \
+            -o movies.csv \
+            "https://huggingface.co/datasets/HenryWaltson/TMDB-IMDB-Movies-Dataset/resolve/main/TMDB%20%20IMDB%20Movies%20Dataset.csv?download=true"
+          curl -L --fail --retry 4 --retry-delay 5 \
+            -o title.akas.tsv.gz \
+            "https://datasets.imdbws.com/title.akas.tsv.gz"
+          ls -lh movies.csv title.akas.tsv.gz
+
+      - name: Filter and build database
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import pandas as pd
+          from pathlib import Path
+
+          SOURCE = Path("movies.csv")
+          AKAS = Path("title.akas.tsv.gz")
+          JSON_OUT = Path("filmes_vote_count_1500.json")
+          CSV_OUT = Path("filmes_vote_count_1500.csv")
+          STATS_OUT = Path("filmes_vote_count_1500_stats.txt")
+
+          source_cols = [
+              "vote_count", "tconst", "title", "original_title", "original_language",
+              "tagline", "directors", "release_date", "genres", "keywords", "poster_path"
+          ]
+
+          selected = []
+          total_source = 0
+
+          for chunk in pd.read_csv(
+              SOURCE,
+              usecols=source_cols,
+              chunksize=50_000,
+              low_memory=False,
+              on_bad_lines="skip",
+          ):
+              total_source += len(chunk)
+              vc = pd.to_numeric(chunk["vote_count"], errors="coerce")
+              part = chunk.loc[vc >= 1500].copy()
+              if not part.empty:
+                  part["vote_count"] = vc.loc[part.index].astype("Int64")
+                  selected.append(part)
+
+          if not selected:
+              raise RuntimeError("Nenhum filme encontrado com vote_count >= 1500.")
+
+          movies = pd.concat(selected, ignore_index=True)
+          movies["tconst"] = movies["tconst"].astype("string")
+          movies = movies[movies["tconst"].notna() & movies["tconst"].str.match(r"^tt\d+$", na=False)].copy()
+
+          # Mantém uma linha por IMDb ID, privilegiando o maior vote_count se houver duplicatas.
+          movies = (
+              movies.sort_values("vote_count", ascending=False)
+                    .drop_duplicates(subset=["tconst"], keep="first")
+                    .reset_index(drop=True)
+          )
+
+          target_ids = set(movies["tconst"].dropna().astype(str))
+          aka_parts = []
+
+          for chunk in pd.read_csv(
+              AKAS,
+              sep="\t",
+              compression="gzip",
+              usecols=["titleId", "ordering", "title", "region", "language", "types", "attributes", "isOriginalTitle"],
+              dtype=str,
+              na_values="\\N",
+              keep_default_na=True,
+              chunksize=1_000_000,
+              on_bad_lines="skip",
+          ):
+              part = chunk[
+                  chunk["titleId"].isin(target_ids) &
+                  chunk["region"].eq("BR") &
+                  chunk["title"].notna()
+              ].copy()
+              if not part.empty:
+                  aka_parts.append(part)
+
+          if aka_parts:
+              akas = pd.concat(aka_parts, ignore_index=True)
+
+              types = akas["types"].fillna("")
+              language = akas["language"].fillna("")
+              attrs = akas["attributes"].fillna("")
+              original_flag = akas["isOriginalTitle"].fillna("")
+
+              # Menor score = melhor candidato a título brasileiro de exibição.
+              akas["_score"] = 100
+              akas.loc[types.str.contains("imdbDisplay", case=False, regex=False), "_score"] -= 60
+              akas.loc[language.eq("pt"), "_score"] -= 20
+              akas.loc[types.str.contains("alternative", case=False, regex=False), "_score"] -= 5
+              akas.loc[original_flag.eq("0"), "_score"] -= 3
+              akas.loc[types.str.contains(r"festival|dvd|video|working", case=False, regex=True), "_score"] += 30
+              akas.loc[attrs.str.contains(r"festival|working", case=False, regex=True), "_score"] += 15
+              akas["_ordering"] = pd.to_numeric(akas["ordering"], errors="coerce").fillna(10**9)
+
+              best = (
+                  akas.sort_values(["titleId", "_score", "_ordering"])
+                      .drop_duplicates("titleId", keep="first")
+                      .set_index("titleId")["title"]
+              )
+              movies["titulo_ptbr"] = movies["tconst"].map(best)
+          else:
+              movies["titulo_ptbr"] = pd.NA
+
+          # Se a obra já é originalmente em português e não há AKA BR, o título original
+          # é um fallback mais seguro do que inventar uma tradução.
+          mask_pt_original = (
+              movies["titulo_ptbr"].isna() &
+              movies["original_language"].astype("string").eq("pt") &
+              movies["original_title"].notna()
+          )
+          movies.loc[mask_pt_original, "titulo_ptbr"] = movies.loc[mask_pt_original, "original_title"]
+
+          filtered_before_title = len(movies)
+          unresolved = int(movies["titulo_ptbr"].isna().sum())
+
+          # Para cumprir literalmente "titulo_ptbr", exclui registros sem título brasileiro resolvido.
+          movies = movies[movies["titulo_ptbr"].notna()].copy()
+
+          movies["ano"] = (
+              movies["release_date"]
+              .astype("string")
+              .str.extract(r"^(\d{4})", expand=False)
+          )
+          movies["poster"] = movies["poster_path"].apply(
+              lambda p: f"https://image.tmdb.org/t/p/w500{p}"
+              if isinstance(p, str) and p.strip().startswith("/")
+              else None
+          )
+
+          out = pd.DataFrame({
+              "titulo_ptbr": movies["titulo_ptbr"],
+              "titulo_original": movies["original_title"],
+              "tagline": movies["tagline"],
+              "diretor": movies["directors"],
+              "ano": movies["ano"],
+              "genero": movies["genres"],
+              "keywords": movies["keywords"],
+              "poster": movies["poster"],
+          })
+
+          # Troca NaN/NA por null no JSON e vazio no CSV.
+          out = out.astype(object).where(pd.notna(out), None)
+          out.to_csv(CSV_OUT, index=False, encoding="utf-8-sig")
+
+          records = out.to_dict(orient="records")
+          with JSON_OUT.open("w", encoding="utf-8") as f:
+              json.dump(records, f, ensure_ascii=False, indent=2)
+
+          stats = (
+              f"Linhas lidas da base TMDb/IMDb: {total_source}\n"
+              f"Filmes com vote_count >= 1500 e IMDb ID único: {filtered_before_title}\n"
+              f"Sem título brasileiro resolvido e excluídos: {unresolved}\n"
+              f"Registros finais: {len(out)}\n"
+              f"Colunas finais: {', '.join(out.columns)}\n"
+          )
+          STATS_OUT.write_text(stats, encoding="utf-8")
+          print(stats)
+          print(out.head(10).to_string(index=False))
+          PY
+
+      - name: Upload database files
+        uses: actions/upload-artifact@v4
+        with:
+          name: filmes-vote-count-1500
+          path: |
+            filmes_vote_count_1500.json
+            filmes_vote_count_1500.csv
+            filmes_vote_count_1500_stats.txt
+          retention-days: 1
+          if-no-files-found: error
