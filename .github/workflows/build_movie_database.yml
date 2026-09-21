@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -48,9 +50,11 @@ jobs:
 
           SOURCE = Path("movies.csv")
           AKAS = Path("title.akas.tsv.gz")
-          JSON_OUT = Path("filmes_vote_count_1500.json")
-          CSV_OUT = Path("filmes_vote_count_1500.csv")
-          STATS_OUT = Path("filmes_vote_count_1500_stats.txt")
+          OUT_DIR = Path("generated/movie_database")
+          OUT_DIR.mkdir(parents=True, exist_ok=True)
+          JSON_OUT = OUT_DIR / "filmes_vote_count_1500.json"
+          CSV_OUT = OUT_DIR / "filmes_vote_count_1500.csv"
+          STATS_OUT = OUT_DIR / "filmes_vote_count_1500_stats.txt"
 
           source_cols = [
               "vote_count", "tconst", "title", "original_title", "original_language",
@@ -79,9 +83,11 @@ jobs:
 
           movies = pd.concat(selected, ignore_index=True)
           movies["tconst"] = movies["tconst"].astype("string")
-          movies = movies[movies["tconst"].notna() & movies["tconst"].str.match(r"^tt\d+$", na=False)].copy()
+          movies = movies[
+              movies["tconst"].notna() &
+              movies["tconst"].str.match(r"^tt\d+$", na=False)
+          ].copy()
 
-          # Mantém uma linha por IMDb ID, privilegiando o maior vote_count se houver duplicatas.
           movies = (
               movies.sort_values("vote_count", ascending=False)
                     .drop_duplicates(subset=["tconst"], keep="first")
@@ -118,7 +124,6 @@ jobs:
               attrs = akas["attributes"].fillna("")
               original_flag = akas["isOriginalTitle"].fillna("")
 
-              # Menor score = melhor candidato a título brasileiro de exibição.
               akas["_score"] = 100
               akas.loc[types.str.contains("imdbDisplay", case=False, regex=False), "_score"] -= 60
               akas.loc[language.eq("pt"), "_score"] -= 20
@@ -137,8 +142,6 @@ jobs:
           else:
               movies["titulo_ptbr"] = pd.NA
 
-          # Se a obra já é originalmente em português e não há AKA BR, o título original
-          # é um fallback mais seguro do que inventar uma tradução.
           mask_pt_original = (
               movies["titulo_ptbr"].isna() &
               movies["original_language"].astype("string").eq("pt") &
@@ -149,7 +152,7 @@ jobs:
           filtered_before_title = len(movies)
           unresolved = int(movies["titulo_ptbr"].isna().sum())
 
-          # Para cumprir literalmente "titulo_ptbr", exclui registros sem título brasileiro resolvido.
+          # Só entram no arquivo final títulos com título brasileiro resolvido.
           movies = movies[movies["titulo_ptbr"].notna()].copy()
 
           movies["ano"] = (
@@ -174,13 +177,11 @@ jobs:
               "poster": movies["poster"],
           })
 
-          # Troca NaN/NA por null no JSON e vazio no CSV.
           out = out.astype(object).where(pd.notna(out), None)
           out.to_csv(CSV_OUT, index=False, encoding="utf-8-sig")
 
-          records = out.to_dict(orient="records")
           with JSON_OUT.open("w", encoding="utf-8") as f:
-              json.dump(records, f, ensure_ascii=False, indent=2)
+              json.dump(out.to_dict(orient="records"), f, ensure_ascii=False, indent=2)
 
           stats = (
               f"Linhas lidas da base TMDb/IMDb: {total_source}\n"
@@ -194,13 +195,22 @@ jobs:
           print(out.head(10).to_string(index=False))
           PY
 
-      - name: Upload database files
-        uses: actions/upload-artifact@v4
-        with:
-          name: filmes-vote-count-1500
-          path: |
-            filmes_vote_count_1500.json
-            filmes_vote_count_1500.csv
-            filmes_vote_count_1500_stats.txt
-          retention-days: 1
-          if-no-files-found: error
+      - name: Create ZIP
+        shell: bash
+        run: |
+          python -m zipfile -c \
+            generated/movie_database/filmes_vote_count_1500.zip \
+            generated/movie_database/filmes_vote_count_1500.json \
+            generated/movie_database/filmes_vote_count_1500.csv \
+            generated/movie_database/filmes_vote_count_1500_stats.txt
+
+      - name: Commit generated database and remove temporary workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/build_movie_database.yml
+          git add generated/movie_database
+          git commit -m "data: add filtered movie database"
+          git push
