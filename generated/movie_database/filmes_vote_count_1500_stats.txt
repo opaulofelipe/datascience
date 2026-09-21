@@ -1,0 +1,5 @@
+Linhas lidas da base TMDb/IMDb: 434803
+Filmes com vote_count >= 1500 e IMDb ID único: 2811
+Sem título brasileiro resolvido e excluídos: 9
+Registros finais: 2802
+Colunas finais: titulo_ptbr, titulo_original, tagline, diretor, ano, genero, keywords, poster
